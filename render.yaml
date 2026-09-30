@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: wjrc-forecast-service
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: FORECAST_API_KEY
+        generateValue: true
