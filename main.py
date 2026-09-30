@@ -64,6 +64,8 @@ class Accuracy(BaseModel):
     rmse: Optional[float] = None
     mape: Optional[float] = None
     holdout: int = 0
+    actual: list[float] = Field(default_factory=list)
+    predicted: list[float] = Field(default_factory=list)
 
 
 class Stationarity(BaseModel):
@@ -203,6 +205,8 @@ def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
         rmse=round(float(np.sqrt(np.mean(sq_err))), 2),
         mape=round(mape, 1) if mape is not None else None,
         holdout=holdout,
+        actual=[round(float(v), 1) for v in actual],
+        predicted=[round(float(v), 1) for v in predicted],
     )
 
 
