@@ -139,88 +139,106 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
     return 1 if acf_s > 0.3 else 0
 
 
-def grid_candidates(n: int, s: int, d: int, D: int):
-    """Box-Jenkins estimation step: with d/D already identified, search the
-    remaining orders (p, q, P, Q) and keep the one AICc prefers. Same bounds
-    as the PHP implementation, scaled to how much history is available.
-
-    Yielded cheapest (fewest total parameters) first: fit_best() below stops
-    once it runs low on time, so trying simple, likely-good candidates first
-    means a time-limited search still lands on a reasonable model instead of
-    whatever happened to be last in iteration order.
-    """
-    seasonal_ok = s > 1 and D >= 0 and n >= (2 * s + 6)
-    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
-    q_max = p_max
-    P_max = 1 if seasonal_ok else 0
-    Q_max = P_max
-
-    candidates = []
-    for p in range(p_max + 1):
-        for q in range(q_max + 1):
-            for P in range(P_max + 1):
-                for Q in range(Q_max + 1):
-                    if not seasonal_ok and (P or Q):
-                        continue
-                    candidates.append((p, q, P, Q))
-
-    candidates.sort(key=lambda c: sum(c))
-    for p, q, P, Q in candidates:
-        yield (p, d, q), (P, D if seasonal_ok else 0, Q, s if seasonal_ok else 0)
-
-
-# Wall-clock budget for the grid search, leaving headroom (within Laravel's
+# Wall-clock budget for the whole search, leaving headroom (within Laravel's
 # own ~18s timeout for this call) for the identification step, the hold-out
 # backtest's extra fit, and response/network overhead. A free, fractional-CPU
 # host means a fixed candidate count can't guarantee a time budget — a time
-# budget can, so the search just fits as many (cheapest-first) candidates as
-# it can before this runs out, rather than guessing at a safe grid size.
+# budget can.
 GRID_SEARCH_BUDGET_SECONDS = 9.0
 
 
 def fit_best(y: list[float], s: int):
-    """Box-Jenkins identification + estimation: identify d/D via stationarity
-    tests, grid-search the remaining candidate orders (cheapest first, inside
-    a fixed time budget), fit each by MLE, and keep the one with the lowest
-    AICc — the standard small-sample-corrected criterion for comparing
-    ARIMA/SARIMA models."""
+    """Box-Jenkins identification + estimation, following the structure of
+    the Hyndman-Khandakar algorithm (Hyndman & Khandakar, 2008, "Automatic
+    Time Series Forecasting: The forecast Package for R" — the same
+    algorithm behind R's forecast::auto.arima() and Python's
+    pmdarima.auto_arima()): identify d/D via stationarity tests, fit a small
+    set of structurally different seed models, then greedily step from the
+    best seed through its neighbors (p, q, P, Q each +/-1) while AICc keeps
+    improving. This reaches a good model in a handful of fits instead of an
+    exhaustive grid — important on a free, fractional-CPU host where every
+    fit is expensive relative to the request's time budget.
+    """
     n = len(y)
     d = identify_d(y)
-    D = identify_seasonal_d(y, d, s) if s > 1 else 0
+    seasonal_ok = s > 1 and n >= (2 * s + 6)
+    D = identify_seasonal_d(y, d, s) if seasonal_ok else 0
 
-    best = None
-    best_aicc = float("inf")
+    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
+    q_max = p_max
+    P_max = 1 if seasonal_ok else 0
+    Q_max = P_max
+    sp = s if seasonal_ok else 0
+
     deadline = time.monotonic() + GRID_SEARCH_BUDGET_SECONDS
+    tried: dict[tuple[int, int, int, int], object] = {}
 
-    for order, seasonal_order in grid_candidates(n, s, d, D):
-        if best is not None and time.monotonic() >= deadline:
-            break
+    def try_fit(p: int, q: int, P: int, Q: int):
+        p, q = min(p, p_max), min(q, q_max)
+        P, Q = min(P, P_max), min(Q, Q_max)
+        key = (p, q, P, Q)
+        if key in tried:
+            return tried[key]
 
-        p, d_, q = order
-        P, D_, Q, sp = seasonal_order
+        order = (p, d, q)
+        seasonal_order = (P, D, Q, sp)
         k = p + q + P + Q
-        n_eff = n - d_ - D_ * (sp or 1)
+        n_eff = n - d - D * (sp or 1)
         if n_eff < 10 or n_eff < (k + 2) * 3:
-            continue
+            tried[key] = None
+            return None
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                model = SARIMAX(
+                res = SARIMAX(
                     y,
                     order=order,
                     seasonal_order=seasonal_order,
                     enforce_stationarity=False,
                     enforce_invertibility=False,
-                )
-                res = model.fit(disp=False, maxiter=35)
+                ).fit(disp=False, maxiter=35)
             aicc = res.aicc
-            if not np.isfinite(aicc):
-                continue
-            if aicc < best_aicc:
-                best_aicc = aicc
-                best = (order, seasonal_order, res)
+            result = (order, seasonal_order, res, aicc) if np.isfinite(aicc) else None
         except Exception:
-            continue
+            result = None
+
+        tried[key] = result
+        return result
+
+    # Seed models: a rich default, white noise, AR-only, and MA-only — the
+    # same four Hyndman-Khandakar starts with, covering structurally
+    # different shapes so the stepwise search below starts from whichever
+    # shape this series actually favors, not just "simplest first".
+    seeds = [(2, 2, 1, 1), (0, 0, 0, 0), (1, 0, 1, 0), (0, 1, 0, 1)]
+    best = None
+    for p, q, P, Q in seeds:
+        r = try_fit(p, q, P, Q)
+        if r and (best is None or r[3] < best[3]):
+            best = r
+        if time.monotonic() >= deadline:
+            break
+
+    # Greedy stepwise refinement from the best seed: try each neighbor one
+    # step away: Hyndman-Khandakar step (accept the first improving move,
+    # then repeat), continue until nothing nearby improves AICc or time runs out.
+    if best is not None:
+        improved = True
+        while improved and time.monotonic() < deadline:
+            improved = False
+            p, _, q = best[0]
+            P, _, Q, _ = best[1]
+            for dp, dq, dP, dQ in [(1, 0, 0, 0), (-1, 0, 0, 0), (0, 1, 0, 0), (0, -1, 0, 0),
+                                    (0, 0, 1, 0), (0, 0, -1, 0), (0, 0, 0, 1), (0, 0, 0, -1)]:
+                np_, nq, nP, nQ = p + dp, q + dq, P + dP, Q + dQ
+                if np_ < 0 or nq < 0 or nP < 0 or nQ < 0:
+                    continue
+                r = try_fit(np_, nq, nP, nQ)
+                if r and r[3] < best[3] - 1e-6:
+                    best = r
+                    improved = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
 
     if best is None:
         # Last-resort fallback for series too short/degenerate for any order
@@ -228,11 +246,11 @@ def fit_best(y: list[float], s: int):
         try:
             order, seasonal_order = (0, 1, 0), (0, 0, 0, 0)
             res = SARIMAX(y, order=order, seasonal_order=seasonal_order).fit(disp=False)
-            best = (order, seasonal_order, res)
+            return order, seasonal_order, res
         except Exception:
             return None
 
-    return best
+    return best[0], best[1], best[2]
 
 
 def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
