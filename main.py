@@ -140,22 +140,30 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
 
 def grid_candidates(n: int, s: int, d: int, D: int):
     """Box-Jenkins estimation step: with d/D already identified, search the
-    remaining orders (p, q, P, Q) and keep the one AICc prefers. Scaled to
-    how much history is available, same bounds as the PHP implementation."""
+    remaining orders (p, q, P, Q) and keep the one AICc prefers.
+
+    Each candidate costs a real numerical MLE fit, and this service runs on a
+    free, fractional-CPU host — so the search is deliberately narrow (AR-only
+    or MA-only on both the regular and seasonal side, never both at once) to
+    keep the whole identification step comfortably inside Laravel's request
+    budget. This trades a little model flexibility for reliably landing a
+    SARIMA fit at all, which matters more than testing every combination.
+    """
     seasonal_ok = s > 1 and D >= 0 and n >= (2 * s + 6)
-    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
+    p_max = 1 if n >= 16 else 0
     q_max = p_max
     P_max = 1 if seasonal_ok else 0
     Q_max = P_max
 
     for p in range(p_max + 1):
         for q in range(q_max + 1):
+            if p and q:
+                continue  # AR-only or MA-only, not both, on the regular side
             for P in range(P_max + 1):
                 for Q in range(Q_max + 1):
+                    if P and Q:
+                        continue  # same constraint on the seasonal side
                     if not seasonal_ok and (P or Q):
-                        continue
-                    k = p + q + P + Q
-                    if k > 6:
                         continue
                     yield (p, d, q), (P, D if seasonal_ok else 0, Q, s if seasonal_ok else 0)
 
@@ -189,7 +197,7 @@ def fit_best(y: list[float], s: int):
                     enforce_stationarity=False,
                     enforce_invertibility=False,
                 )
-                res = model.fit(disp=False, maxiter=50)
+                res = model.fit(disp=False, maxiter=35)
             aicc = res.aicc
             if not np.isfinite(aicc):
                 continue
@@ -233,7 +241,7 @@ def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
                 seasonal_order=seasonal_order,
                 enforce_stationarity=False,
                 enforce_invertibility=False,
-            ).fit(disp=False, maxiter=50)
+            ).fit(disp=False, maxiter=35)
         predicted = res.get_forecast(holdout).predicted_mean
         predicted = np.maximum(predicted, 0)
     except Exception:
