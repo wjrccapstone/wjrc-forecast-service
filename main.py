@@ -94,42 +94,89 @@ def order_label(order: tuple, seasonal_order: tuple) -> str:
     return f"ARIMA({p},{d},{q})"
 
 
-def grid_candidates(n: int, s: int):
-    """Same order-search bounds as the PHP implementation, scaled to how much
-    history is available, so results stay comparable between the two."""
-    seasonal_ok = s > 1 and n >= (2 * s + 6)
+def identify_d(y: list[float], max_d: int = 2) -> int:
+    """Box-Jenkins identification step for the regular differencing order:
+    Augmented Dickey-Fuller unit-root test on the series, differencing and
+    retesting until it rejects the unit-root null (p < 0.05) or max_d is
+    reached. This is the textbook way to pick d — testing it directly,
+    instead of grid-searching it alongside every other order — which is
+    also why it's cheap: one ADF test per candidate d, not a full model fit.
+    """
+    w = list(y)
+    for d in range(max_d + 1):
+        if len(w) < 8:
+            return d
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                _, p_value = adfuller(w, autolag="AIC")[:2]
+            if p_value < 0.05:
+                return d
+        except Exception:
+            return d
+        w = np.diff(w).tolist()
+    return max_d
+
+
+def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
+    """Seasonal-differencing identification: regular-difference the series d
+    times, then check its autocorrelation at the seasonal lag s. A strong
+    positive autocorrelation there (same threshold the PHP version used)
+    means the seasonal pattern isn't settling back to a stable level on its
+    own and needs a seasonal difference."""
+    w = y
+    for _ in range(d):
+        w = np.diff(w).tolist()
+    n = len(w)
+    if n < 2 * s:
+        return 0
+    arr = np.array(w)
+    mean = arr.mean()
+    num = np.sum((arr[s:] - mean) * (arr[:-s] - mean))
+    den = np.sum((arr - mean) ** 2)
+    acf_s = num / den if den > 0 else 0.0
+    return 1 if acf_s > 0.3 else 0
+
+
+def grid_candidates(n: int, s: int, d: int, D: int):
+    """Box-Jenkins estimation step: with d/D already identified, search the
+    remaining orders (p, q, P, Q) and keep the one AICc prefers. Scaled to
+    how much history is available, same bounds as the PHP implementation."""
+    seasonal_ok = s > 1 and D >= 0 and n >= (2 * s + 6)
     p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
     q_max = p_max
     P_max = 1 if seasonal_ok else 0
     Q_max = P_max
 
     for p in range(p_max + 1):
-        for d in range(0, 3):
-            for q in range(q_max + 1):
-                for P in range(P_max + 1):
-                    for D in range(0, 2):
-                        for Q in range(Q_max + 1):
-                            if not seasonal_ok and (P or D or Q):
-                                continue
-                            k = p + q + P + Q
-                            if k > 6:
-                                continue
-                            yield (p, d, q), (P, D, Q, s if seasonal_ok else 0)
+        for q in range(q_max + 1):
+            for P in range(P_max + 1):
+                for Q in range(Q_max + 1):
+                    if not seasonal_ok and (P or Q):
+                        continue
+                    k = p + q + P + Q
+                    if k > 6:
+                        continue
+                    yield (p, d, q), (P, D if seasonal_ok else 0, Q, s if seasonal_ok else 0)
 
 
 def fit_best(y: list[float], s: int):
-    """Box-Jenkins identification + estimation: grid-search candidate orders,
-    fit each by MLE, and keep the one with the lowest AICc — the standard
-    small-sample-corrected criterion for comparing ARIMA/SARIMA models."""
+    """Box-Jenkins identification + estimation: identify d/D via stationarity
+    tests, grid-search the remaining candidate orders, fit each by MLE, and
+    keep the one with the lowest AICc — the standard small-sample-corrected
+    criterion for comparing ARIMA/SARIMA models."""
     n = len(y)
+    d = identify_d(y)
+    D = identify_seasonal_d(y, d, s) if s > 1 else 0
+
     best = None
     best_aicc = float("inf")
 
-    for order, seasonal_order in grid_candidates(n, s):
-        p, d, q = order
-        P, D, Q, sp = seasonal_order
+    for order, seasonal_order in grid_candidates(n, s, d, D):
+        p, d_, q = order
+        P, D_, Q, sp = seasonal_order
         k = p + q + P + Q
-        n_eff = n - d - D * (sp or 1)
+        n_eff = n - d_ - D_ * (sp or 1)
         if n_eff < 10 or n_eff < (k + 2) * 3:
             continue
         try:
@@ -142,7 +189,7 @@ def fit_best(y: list[float], s: int):
                     enforce_stationarity=False,
                     enforce_invertibility=False,
                 )
-                res = model.fit(disp=False, maxiter=100)
+                res = model.fit(disp=False, maxiter=50)
             aicc = res.aicc
             if not np.isfinite(aicc):
                 continue
@@ -186,7 +233,7 @@ def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
                 seasonal_order=seasonal_order,
                 enforce_stationarity=False,
                 enforce_invertibility=False,
-            ).fit(disp=False, maxiter=100)
+            ).fit(disp=False, maxiter=50)
         predicted = res.get_forecast(holdout).predicted_mean
         predicted = np.maximum(predicted, 0)
     except Exception:
