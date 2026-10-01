@@ -7,8 +7,10 @@ the raw job-order / product-sales history from the database and all of the
 descriptive analytics around the forecast (seasonal profile, top services,
 etc.) — this service's only job is: given a numeric series, fit a SARIMA
 model (auto-selected by AICc, the standard Box-Jenkins model-selection
-criterion) and return the forecast, its confidence interval, an accuracy
-backtest, and a couple of diagnostic checks.
+criterion), fit a non-seasonal ARIMA baseline on the same data, and return
+the forecast, its confidence interval, an accuracy backtest for each (MSE,
+MAE, RMSE, MAPE on the same 12-month hold-out), and a couple of diagnostic
+checks — per FR21.
 
 Using statsmodels here (instead of a hand-rolled optimizer) means the actual
 MLE fitting, forecast-interval math, and statistical tests (ADF, Ljung-Box)
@@ -76,6 +78,14 @@ class Stationarity(BaseModel):
     is_stationary: Optional[bool] = None
 
 
+class Baseline(BaseModel):
+    """Non-seasonal ARIMA fit on the same series, scored on the same
+    hold-out window as the SARIMA model — FR21's comparison baseline."""
+    fitted: bool
+    order_label: str
+    accuracy: Accuracy
+
+
 class ForecastResponse(BaseModel):
     fitted: bool
     order: list[int]
@@ -85,6 +95,7 @@ class ForecastResponse(BaseModel):
     forecast: list[ForecastPoint]
     accuracy: Accuracy
     stationarity: Stationarity
+    baseline: Optional[Baseline] = None
 
 
 def order_label(order: tuple, seasonal_order: tuple) -> str:
@@ -139,51 +150,42 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
     return 1 if acf_s > 0.3 else 0
 
 
-# Wall-clock budget for the whole search, leaving headroom (within Laravel's
-# ~24s timeout for this call) for the identification step, the hold-out
-# backtest's extra fit, and response/network overhead. A free, fractional-CPU
-# host means a fixed candidate count can't guarantee a time budget — a time
-# budget can.
-GRID_SEARCH_BUDGET_SECONDS = 15.0
+# Wall-clock budget per search call (SARIMA and the ARIMA baseline each get
+# their own), leaving headroom within Laravel's ~24s timeout for the
+# identification step, two hold-out backtest fits, and response/network
+# overhead. A free, fractional-CPU host means a fixed candidate count can't
+# guarantee a time budget — a time budget can.
+GRID_SEARCH_BUDGET_SECONDS = 6.0
 
 
-def fit_best(y: list[float], s: int):
-    """Box-Jenkins identification + estimation, following the structure of
-    the Hyndman-Khandakar algorithm (Hyndman & Khandakar, 2008, "Automatic
-    Time Series Forecasting: The forecast Package for R" — the same
-    algorithm behind R's forecast::auto.arima() and Python's
-    pmdarima.auto_arima()): identify d/D via stationarity tests, fit a small
-    set of structurally different seed models, then greedily step from the
-    best seed through its neighbors (p, q, P, Q each +/-1) while AICc keeps
-    improving. This reaches a good model in a handful of fits instead of an
-    exhaustive grid — important on a free, fractional-CPU host where every
-    fit is expensive relative to the request's time budget.
+def search_arima(y: list[float], d: int, p_max: int, q_max: int, D: int = 0, P_max: int = 0, Q_max: int = 0, s: int = 0):
+    """Hyndman-Khandakar search (Hyndman & Khandakar, 2008, "Automatic Time
+    Series Forecasting: The forecast Package for R" — the same algorithm
+    behind R's forecast::auto.arima() and Python's pmdarima.auto_arima()):
+    fit a small set of structurally different seed models, then greedily
+    step through neighbors (p, q, P, Q each +/-1) while AICc keeps
+    improving. Passing P_max=Q_max=0 (D=0, s=0) runs this as a plain
+    non-seasonal ARIMA search — used for FR21's baseline comparison.
+
+    Reaches a good model in a handful of fits instead of an exhaustive grid
+    — important on a free, fractional-CPU host where every fit is expensive
+    relative to the request's time budget.
     """
     n = len(y)
-    d = identify_d(y)
-    seasonal_ok = s > 1 and n >= (2 * s + 6)
-    D = identify_seasonal_d(y, d, s) if seasonal_ok else 0
-
-    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
-    q_max = p_max
-    P_max = 1 if seasonal_ok else 0
-    Q_max = P_max
-    sp = s if seasonal_ok else 0
-
     deadline = time.monotonic() + GRID_SEARCH_BUDGET_SECONDS
     tried: dict[tuple[int, int, int, int], object] = {}
 
     def try_fit(p: int, q: int, P: int, Q: int):
-        p, q = min(p, p_max), min(q, q_max)
-        P, Q = min(P, P_max), min(Q, Q_max)
+        p, q = min(max(p, 0), p_max), min(max(q, 0), q_max)
+        P, Q = min(max(P, 0), P_max), min(max(Q, 0), Q_max)
         key = (p, q, P, Q)
         if key in tried:
             return tried[key]
 
         order = (p, d, q)
-        seasonal_order = (P, D, Q, sp)
+        seasonal_order = (P, D, Q, s)
         k = p + q + P + Q
-        n_eff = n - d - D * (sp or 1)
+        n_eff = n - d - D * (s or 1)
         if n_eff < 10 or n_eff < (k + 2) * 3:
             tried[key] = None
             return None
@@ -209,7 +211,12 @@ def fit_best(y: list[float], s: int):
     # same four Hyndman-Khandakar starts with, covering structurally
     # different shapes so the stepwise search below starts from whichever
     # shape this series actually favors, not just "simplest first".
-    seeds = [(2, 2, 1, 1), (0, 0, 0, 0), (1, 0, 1, 0), (0, 1, 0, 1)]
+    seeds = [
+        (min(2, p_max), min(2, q_max), min(1, P_max), min(1, Q_max)),
+        (0, 0, 0, 0),
+        (min(1, p_max), 0, min(1, P_max), 0),
+        (0, min(1, q_max), 0, min(1, Q_max)),
+    ]
     best = None
     for p, q, P, Q in seeds:
         r = try_fit(p, q, P, Q)
@@ -219,8 +226,8 @@ def fit_best(y: list[float], s: int):
             break
 
     # Greedy stepwise refinement from the best seed: try each neighbor one
-    # step away: Hyndman-Khandakar step (accept the first improving move,
-    # then repeat), continue until nothing nearby improves AICc or time runs out.
+    # step away, accept the first improving move, then repeat, continue
+    # until nothing nearby improves AICc or time runs out.
     if best is not None:
         improved = True
         while improved and time.monotonic() < deadline:
@@ -240,24 +247,26 @@ def fit_best(y: list[float], s: int):
                 if time.monotonic() >= deadline:
                     break
 
-    if best is None:
-        # Last-resort fallback for series too short/degenerate for any order
-        # search to converge: a naive-drift ARIMA(0,1,0).
-        try:
-            order, seasonal_order = (0, 1, 0), (0, 0, 0, 0)
-            res = SARIMAX(y, order=order, seasonal_order=seasonal_order).fit(disp=False)
-            return order, seasonal_order, res
-        except Exception:
-            return None
+    return (best[0], best[1], best[2]) if best else None
 
-    return best[0], best[1], best[2]
+
+def fit_naive(y: list[float]):
+    """Last-resort fallback for series too short/degenerate for any order
+    search to converge: a naive-drift ARIMA(0,1,0)."""
+    try:
+        order, seasonal_order = (0, 1, 0), (0, 0, 0, 0)
+        res = SARIMAX(y, order=order, seasonal_order=seasonal_order).fit(disp=False)
+        return order, seasonal_order, res
+    except Exception:
+        return None
 
 
 def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
     """Hold-out backtest: refit the already-selected order on all but the most
     recent periods, forecast that held-out window, and score against what
-    actually happened. Same holdout sizing convention as the PHP version
-    (20% of history, clamped to 3-12 periods) so results stay comparable."""
+    actually happened. 12-month hold-out per FR21 (20% of history, clamped
+    to 3-12 periods — the same convention the PHP version used, so results
+    stay comparable with history shorter than 60 months)."""
     n = len(y)
     holdout = min(12, max(3, int(n * 0.2)))
     train_size = n - holdout
@@ -338,33 +347,40 @@ def health():
 def forecast(req: ForecastRequest):
     y = req.values
     n = len(y)
-    z = Z_SCORES.get(req.confidence, 1.96)
     alpha = 1 - req.confidence / 100
 
+    not_fitted = ForecastResponse(
+        fitted=False,
+        order=[0, 0, 0],
+        seasonal_order=[0, 0, 0, 0],
+        order_label="—",
+        forecast=[],
+        accuracy=Accuracy(available=False),
+        stationarity=Stationarity(),
+    )
+
     if n < 4:
-        return ForecastResponse(
-            fitted=False,
-            order=[0, 0, 0],
-            seasonal_order=[0, 0, 0, 0],
-            order_label="—",
-            forecast=[],
-            accuracy=Accuracy(available=False),
-            stationarity=Stationarity(),
-        )
+        return not_fitted
 
-    best = fit_best(y, req.seasonal_period)
-    if best is None:
-        return ForecastResponse(
-            fitted=False,
-            order=[0, 0, 0],
-            seasonal_order=[0, 0, 0, 0],
-            order_label="—",
-            forecast=[],
-            accuracy=Accuracy(available=False),
-            stationarity=Stationarity(),
-        )
+    s = req.seasonal_period
+    d = identify_d(y)
+    seasonal_ok = s > 1 and n >= (2 * s + 6)
+    D = identify_seasonal_d(y, d, s) if seasonal_ok else 0
+    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
+    q_max = p_max
+    P_max = 1 if seasonal_ok else 0
+    Q_max = P_max
+    sp = s if seasonal_ok else 0
 
-    order, seasonal_order, res = best
+    # FR21: evaluate SARIMA against a non-seasonal ARIMA baseline on the same
+    # hold-out — same d, same data, baseline just has no seasonal component.
+    sarima = search_arima(y, d, p_max, q_max, D, P_max, Q_max, sp) or fit_naive(y)
+    baseline_fit = search_arima(y, d, p_max, q_max) or fit_naive(y)
+
+    if sarima is None:
+        return not_fitted
+
+    order, seasonal_order, res = sarima
 
     fc = res.get_forecast(req.steps)
     frame = fc.summary_frame(alpha=alpha)
@@ -380,6 +396,15 @@ def forecast(req: ForecastRequest):
     accuracy = backtest_accuracy(y, order, seasonal_order)
     stationarity = stationarity_check(y, res.resid if hasattr(res, "resid") else None)
 
+    baseline = None
+    if baseline_fit is not None:
+        b_order, b_seasonal_order, _ = baseline_fit
+        baseline = Baseline(
+            fitted=True,
+            order_label=order_label(b_order, b_seasonal_order),
+            accuracy=backtest_accuracy(y, b_order, b_seasonal_order),
+        )
+
     return ForecastResponse(
         fitted=True,
         order=list(order),
@@ -389,4 +414,5 @@ def forecast(req: ForecastRequest):
         forecast=points,
         accuracy=accuracy,
         stationarity=stationarity,
+        baseline=baseline,
     )
