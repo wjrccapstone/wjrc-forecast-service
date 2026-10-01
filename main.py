@@ -17,6 +17,7 @@ in Python or R would use.
 """
 
 import os
+import time
 import warnings
 from typing import Optional
 
@@ -140,47 +141,61 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
 
 def grid_candidates(n: int, s: int, d: int, D: int):
     """Box-Jenkins estimation step: with d/D already identified, search the
-    remaining orders (p, q, P, Q) and keep the one AICc prefers.
+    remaining orders (p, q, P, Q) and keep the one AICc prefers. Same bounds
+    as the PHP implementation, scaled to how much history is available.
 
-    Each candidate costs a real numerical MLE fit, and this service runs on a
-    free, fractional-CPU host — so the search is deliberately narrow (AR-only
-    or MA-only on both the regular and seasonal side, never both at once) to
-    keep the whole identification step comfortably inside Laravel's request
-    budget. This trades a little model flexibility for reliably landing a
-    SARIMA fit at all, which matters more than testing every combination.
+    Yielded cheapest (fewest total parameters) first: fit_best() below stops
+    once it runs low on time, so trying simple, likely-good candidates first
+    means a time-limited search still lands on a reasonable model instead of
+    whatever happened to be last in iteration order.
     """
     seasonal_ok = s > 1 and D >= 0 and n >= (2 * s + 6)
-    p_max = 1 if n >= 16 else 0
+    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
     q_max = p_max
     P_max = 1 if seasonal_ok else 0
     Q_max = P_max
 
+    candidates = []
     for p in range(p_max + 1):
         for q in range(q_max + 1):
-            if p and q:
-                continue  # AR-only or MA-only, not both, on the regular side
             for P in range(P_max + 1):
                 for Q in range(Q_max + 1):
-                    if P and Q:
-                        continue  # same constraint on the seasonal side
                     if not seasonal_ok and (P or Q):
                         continue
-                    yield (p, d, q), (P, D if seasonal_ok else 0, Q, s if seasonal_ok else 0)
+                    candidates.append((p, q, P, Q))
+
+    candidates.sort(key=lambda c: sum(c))
+    for p, q, P, Q in candidates:
+        yield (p, d, q), (P, D if seasonal_ok else 0, Q, s if seasonal_ok else 0)
+
+
+# Wall-clock budget for the grid search, leaving headroom (within Laravel's
+# own ~18s timeout for this call) for the identification step, the hold-out
+# backtest's extra fit, and response/network overhead. A free, fractional-CPU
+# host means a fixed candidate count can't guarantee a time budget — a time
+# budget can, so the search just fits as many (cheapest-first) candidates as
+# it can before this runs out, rather than guessing at a safe grid size.
+GRID_SEARCH_BUDGET_SECONDS = 9.0
 
 
 def fit_best(y: list[float], s: int):
     """Box-Jenkins identification + estimation: identify d/D via stationarity
-    tests, grid-search the remaining candidate orders, fit each by MLE, and
-    keep the one with the lowest AICc — the standard small-sample-corrected
-    criterion for comparing ARIMA/SARIMA models."""
+    tests, grid-search the remaining candidate orders (cheapest first, inside
+    a fixed time budget), fit each by MLE, and keep the one with the lowest
+    AICc — the standard small-sample-corrected criterion for comparing
+    ARIMA/SARIMA models."""
     n = len(y)
     d = identify_d(y)
     D = identify_seasonal_d(y, d, s) if s > 1 else 0
 
     best = None
     best_aicc = float("inf")
+    deadline = time.monotonic() + GRID_SEARCH_BUDGET_SECONDS
 
     for order, seasonal_order in grid_candidates(n, s, d, D):
+        if best is not None and time.monotonic() >= deadline:
+            break
+
         p, d_, q = order
         P, D_, Q, sp = seasonal_order
         k = p + q + P + Q
