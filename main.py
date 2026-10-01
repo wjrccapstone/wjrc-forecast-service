@@ -155,7 +155,7 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
 # identification step, two hold-out backtest fits, and response/network
 # overhead. A free, fractional-CPU host means a fixed candidate count can't
 # guarantee a time budget — a time budget can.
-GRID_SEARCH_BUDGET_SECONDS = 6.0
+GRID_SEARCH_BUDGET_SECONDS = 4.0
 
 
 def search_arima(y: list[float], d: int, p_max: int, q_max: int, D: int = 0, P_max: int = 0, Q_max: int = 0, s: int = 0):
