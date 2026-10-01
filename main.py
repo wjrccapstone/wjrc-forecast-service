@@ -140,11 +140,11 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
 
 
 # Wall-clock budget for the whole search, leaving headroom (within Laravel's
-# own ~18s timeout for this call) for the identification step, the hold-out
+# ~24s timeout for this call) for the identification step, the hold-out
 # backtest's extra fit, and response/network overhead. A free, fractional-CPU
 # host means a fixed candidate count can't guarantee a time budget — a time
 # budget can.
-GRID_SEARCH_BUDGET_SECONDS = 9.0
+GRID_SEARCH_BUDGET_SECONDS = 15.0
 
 
 def fit_best(y: list[float], s: int):
