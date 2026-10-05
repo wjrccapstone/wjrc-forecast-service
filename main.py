@@ -208,6 +208,11 @@ def search_arima(y: list[float], d: int, p_max: int, q_max: int, D: int = 0, P_m
                     trend=trend_for(d, D),
                     enforce_stationarity=False,
                     enforce_invertibility=False,
+                    # Solve the noise variance analytically instead of searching
+                    # for it: one fewer parameter, so each fit converges in far
+                    # fewer iterations — keeps the slow free host inside the
+                    # website's ~27s request budget.
+                    concentrate_scale=True,
                 ).fit(disp=False, maxiter=35)
             aicc = res.aicc
             result = (order, seasonal_order, res, aicc) if np.isfinite(aicc) else None
@@ -294,6 +299,7 @@ def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
                 trend=trend_for(order[1], seasonal_order[1]),
                 enforce_stationarity=False,
                 enforce_invertibility=False,
+                    concentrate_scale=True,
             ).fit(disp=False, maxiter=35)
         predicted = res.get_forecast(holdout).predicted_mean
         predicted = np.maximum(predicted, 0)
