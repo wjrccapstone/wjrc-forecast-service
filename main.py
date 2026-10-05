@@ -158,6 +158,15 @@ def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
 GRID_SEARCH_BUDGET_SECONDS = 4.0
 
 
+def trend_for(d: int, D: int) -> str:
+    """With exactly one difference in the model (typically just the seasonal
+    one), a constant term is what carries a steady growth trend forward —
+    without it the forecast would flatten out. With two or more differences a
+    constant would instead imply a runaway quadratic trend, so it's left out
+    (the usual auto.arima convention)."""
+    return "c" if d + D == 1 else "n"
+
+
 def search_arima(y: list[float], d: int, p_max: int, q_max: int, D: int = 0, P_max: int = 0, Q_max: int = 0, s: int = 0):
     """Hyndman-Khandakar search (Hyndman & Khandakar, 2008, "Automatic Time
     Series Forecasting: The forecast Package for R" — the same algorithm
@@ -196,6 +205,7 @@ def search_arima(y: list[float], d: int, p_max: int, q_max: int, D: int = 0, P_m
                     y,
                     order=order,
                     seasonal_order=seasonal_order,
+                    trend=trend_for(d, D),
                     enforce_stationarity=False,
                     enforce_invertibility=False,
                 ).fit(disp=False, maxiter=35)
@@ -281,6 +291,7 @@ def backtest_accuracy(y: list[float], order, seasonal_order) -> Accuracy:
                 train,
                 order=order,
                 seasonal_order=seasonal_order,
+                trend=trend_for(order[1], seasonal_order[1]),
                 enforce_stationarity=False,
                 enforce_invertibility=False,
             ).fit(disp=False, maxiter=35)
@@ -363,9 +374,15 @@ def forecast(req: ForecastRequest):
         return not_fitted
 
     s = req.seasonal_period
-    d = identify_d(y)
     seasonal_ok = s > 1 and n >= (2 * s + 6)
-    D = identify_seasonal_d(y, d, s) if seasonal_ok else 0
+    # Seasonal difference first, then test whether a regular difference is
+    # still needed on the seasonally-differenced series (Box-Jenkins; Hyndman &
+    # Athanasopoulos, "Forecasting: Principles and Practice", ch. 9). Testing
+    # the raw series first lets strong seasonality fool the ADF test into
+    # always picking d=1, and d=1 on top of D=1 over-differences: the model
+    # then projects one unusual month's year-over-year change into the future.
+    D = identify_seasonal_d(y, 0, s) if seasonal_ok else 0
+    d = identify_d(np.diff(y, s).tolist() if D else y)
     p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
     q_max = p_max
     P_max = 1 if seasonal_ok else 0
