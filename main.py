@@ -26,8 +26,9 @@ from typing import Optional
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+from scipy import stats as sps
 from statsmodels.stats.diagnostic import acorr_ljungbox
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import acf, adfuller, kpss, pacf
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
@@ -83,6 +84,7 @@ class Baseline(BaseModel):
     hold-out window as the SARIMA model — FR21's comparison baseline."""
     fitted: bool
     order_label: str
+    order: list[int] = Field(default_factory=list)
     accuracy: Accuracy
 
 
@@ -108,11 +110,13 @@ def order_label(order: tuple, seasonal_order: tuple) -> str:
 
 def identify_d(y: list[float], max_d: int = 2) -> int:
     """Box-Jenkins identification step for the regular differencing order:
-    Augmented Dickey-Fuller unit-root test on the series, differencing and
-    retesting until it rejects the unit-root null (p < 0.05) or max_d is
-    reached. This is the textbook way to pick d — testing it directly,
-    instead of grid-searching it alongside every other order — which is
-    also why it's cheap: one ADF test per candidate d, not a full model fit.
+    KPSS stationarity test on the series, differencing and retesting while it
+    rejects the stationarity null (p < 0.05) or until max_d is reached — the
+    unit-root test R's forecast::auto.arima() / ndiffs() use by default. (ADF
+    has low power on short series and tends to over-difference: on this
+    system's ~60-point seasonally-differenced series it asked for d=2.)
+    Testing d directly instead of grid-searching it alongside every other
+    order is also why it's cheap: one test per candidate d, not a model fit.
     """
     w = list(y)
     for d in range(max_d + 1):
@@ -121,13 +125,20 @@ def identify_d(y: list[float], max_d: int = 2) -> int:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                _, p_value = adfuller(w, autolag="AIC")[:2]
-            if p_value < 0.05:
+                p_value = kpss(w, regression="c", nlags="auto")[1]
+            if p_value >= 0.05:
                 return d
         except Exception:
             return d
         w = np.diff(w).tolist()
     return max_d
+
+
+def seasonal_diff(y, s: int) -> list[float]:
+    """Lag-s seasonal difference y[t] - y[t-s] (not np.diff(y, s), which is the
+    s-th order regular difference)."""
+    arr = np.asarray(y, dtype=float)
+    return (arr[s:] - arr[:-s]).tolist()
 
 
 def identify_seasonal_d(y: list[float], d: int, s: int) -> int:
@@ -355,6 +366,34 @@ def stationarity_check(y: list[float], residuals: Optional[np.ndarray]) -> Stati
     )
 
 
+def select_models(y: list[float], s: int):
+    """Box-Jenkins identification + AICc order search for the SARIMA model and
+    its non-seasonal ARIMA baseline (FR21). Returns (sarima, baseline), each a
+    (order, seasonal_order, fitted results) tuple or None."""
+    n = len(y)
+    seasonal_ok = s > 1 and n >= (2 * s + 6)
+    # Seasonal difference first, then test whether a regular difference is
+    # still needed on the seasonally-differenced series (Box-Jenkins; Hyndman &
+    # Athanasopoulos, "Forecasting: Principles and Practice", ch. 9). Testing
+    # the raw series first lets strong seasonality fool the ADF test into
+    # always picking d=1, and d=1 on top of D=1 over-differences: the model
+    # then projects one unusual month's year-over-year change into the future.
+    D = identify_seasonal_d(y, 0, s) if seasonal_ok else 0
+    d = identify_d(seasonal_diff(y, s) if D else y)
+    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
+    q_max = p_max
+    P_max = 1 if seasonal_ok else 0
+    Q_max = P_max
+    sp = s if seasonal_ok else 0
+
+    # FR21: evaluate SARIMA against a non-seasonal ARIMA baseline on the same
+    # hold-out — same d, same data, baseline just has no seasonal component.
+    sarima = search_arima(y, d, p_max, q_max, D, P_max, Q_max, sp) or fit_naive(y)
+    baseline = search_arima(y, d, p_max, q_max) or fit_naive(y)
+
+    return sarima, baseline
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -379,26 +418,7 @@ def forecast(req: ForecastRequest):
     if n < 4:
         return not_fitted
 
-    s = req.seasonal_period
-    seasonal_ok = s > 1 and n >= (2 * s + 6)
-    # Seasonal difference first, then test whether a regular difference is
-    # still needed on the seasonally-differenced series (Box-Jenkins; Hyndman &
-    # Athanasopoulos, "Forecasting: Principles and Practice", ch. 9). Testing
-    # the raw series first lets strong seasonality fool the ADF test into
-    # always picking d=1, and d=1 on top of D=1 over-differences: the model
-    # then projects one unusual month's year-over-year change into the future.
-    D = identify_seasonal_d(y, 0, s) if seasonal_ok else 0
-    d = identify_d(np.diff(y, s).tolist() if D else y)
-    p_max = 2 if n >= 30 else (1 if n >= 16 else 0)
-    q_max = p_max
-    P_max = 1 if seasonal_ok else 0
-    Q_max = P_max
-    sp = s if seasonal_ok else 0
-
-    # FR21: evaluate SARIMA against a non-seasonal ARIMA baseline on the same
-    # hold-out — same d, same data, baseline just has no seasonal component.
-    sarima = search_arima(y, d, p_max, q_max, D, P_max, Q_max, sp) or fit_naive(y)
-    baseline_fit = search_arima(y, d, p_max, q_max) or fit_naive(y)
+    sarima, baseline_fit = select_models(y, req.seasonal_period)
 
     if sarima is None:
         return not_fitted
@@ -425,6 +445,7 @@ def forecast(req: ForecastRequest):
         baseline = Baseline(
             fitted=True,
             order_label=order_label(b_order, b_seasonal_order),
+            order=list(b_order),
             accuracy=backtest_accuracy(y, b_order, b_seasonal_order),
         )
 
@@ -439,3 +460,293 @@ def forecast(req: ForecastRequest):
         stationarity=stationarity,
         baseline=baseline,
     )
+
+
+# ---------------------------------------------------------------------------
+# Model validation — the Box-Jenkins diagnostic-checking step plus an
+# out-of-sample test, reported in full (series, not just summary numbers) so
+# the Laravel app can chart every stage: differencing, stationarity tests,
+# residual diagnostics, and hold-out errors / accuracy (MAE, RMSE, MAPE, MASE).
+# ---------------------------------------------------------------------------
+
+
+class ValidateRequest(BaseModel):
+    values: list[float] = Field(..., min_length=1)
+    seasonal_period: int = 12
+    confidence: int = 95
+    # The exact orders the live forecast is using, so the validation describes
+    # that model rather than re-selecting one. Searched afresh if omitted.
+    order: Optional[list[int]] = None
+    seasonal_order: Optional[list[int]] = None
+    baseline_order: Optional[list[int]] = None
+
+
+def num(x, digits: int = 4):
+    """JSON-safe rounded float (NaN/inf → None)."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(x, digits) if np.isfinite(x) else None
+
+
+def nums(xs, digits: int = 4):
+    return [num(x, digits) for x in xs]
+
+
+def fit_order(y, order, seasonal_order):
+    """Fit one fixed order with the same estimator settings the search and the
+    /forecast backtest use, so validation scores the same model."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return SARIMAX(
+            y,
+            order=tuple(order),
+            seasonal_order=tuple(seasonal_order),
+            trend=trend_for(order[1], seasonal_order[1]),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            concentrate_scale=True,
+        ).fit(disp=False, maxiter=35)
+
+
+def adf_test(w):
+    """Augmented Dickey-Fuller. H0: unit root (non-stationary); p < 0.05 rejects it."""
+    if len(w) < 8:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            stat, p, lags, nobs, crit, _ = adfuller(w, autolag="AIC")
+    except Exception:
+        return None
+    return {
+        "statistic": num(stat),
+        "p_value": num(p),
+        "lags": int(lags),
+        "nobs": int(nobs),
+        "critical": {k: num(v) for k, v in crit.items()},
+        "stationary": bool(p < 0.05),
+    }
+
+
+def kpss_test(w):
+    """KPSS — the complementary test. H0: stationary; p < 0.05 rejects it. Its
+    p-value is interpolated from a table, so statsmodels caps it to [0.01, 0.10]."""
+    if len(w) < 8:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            stat, p, lags, crit = kpss(w, regression="c", nlags="auto")
+    except Exception:
+        return None
+    return {
+        "statistic": num(stat),
+        "p_value": num(p),
+        "lags": int(lags),
+        "critical": {k: num(crit[k]) for k in ("10%", "5%", "1%") if k in crit},
+        "stationary": bool(p >= 0.05),
+        "p_bounded": bool(p <= 0.01 or p >= 0.1),
+    }
+
+
+def correlogram(w, max_lag: int):
+    n = len(w)
+    lags = min(max_lag, n // 2 - 1)
+    if lags < 1:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a = acf(w, nlags=lags, fft=False)
+            pa = pacf(w, nlags=lags, method="ywm")
+    except Exception:
+        return None
+    return {
+        "lags": list(range(1, lags + 1)),
+        "acf": nums(a[1:]),
+        "pacf": nums(pa[1:]),
+        # Approximate 95% significance bound for a white-noise series.
+        "bound": num(1.96 / np.sqrt(n)),
+    }
+
+
+def rolling_stats(w, window: int):
+    arr = np.asarray(w, dtype=float)
+    means, stds = [], []
+    for i in range(len(arr)):
+        if i + 1 < window:
+            means.append(None)
+            stds.append(None)
+            continue
+        seg = arr[i + 1 - window:i + 1]
+        means.append(num(seg.mean(), 2))
+        stds.append(num(seg.std(ddof=1), 2))
+    return {"window": window, "mean": means, "std": stds}
+
+
+def describe_stage(key, label, offset, w, s):
+    window = s if s > 1 and len(w) >= 2 * s else max(3, len(w) // 6)
+    return {
+        "key": key,
+        "label": label,
+        "offset": offset,
+        "values": nums(w, 2),
+        "adf": adf_test(w),
+        "kpss": kpss_test(w),
+        "rolling": rolling_stats(w, window),
+        "correlogram": correlogram(w, max(2 * s, 12) if s > 1 else 12),
+    }
+
+
+def error_metrics(actual, predicted, train, m: int):
+    """MAE, MSE, RMSE, MAPE and MASE on the hold-out. MASE scales MAE by the
+    in-sample MAE of the (seasonal) naive forecast on the training data
+    (Hyndman & Koehler, 2006): below 1 means better than naive."""
+    a = np.asarray(actual, dtype=float)
+    p = np.asarray(predicted, dtype=float)
+    e = a - p
+    nonzero = a != 0
+    tr = np.asarray(train, dtype=float)
+    scale = float(np.mean(np.abs(tr[m:] - tr[:-m]))) if len(tr) > m else None
+    mae = float(np.mean(np.abs(e)))
+    return {
+        "mae": num(mae, 2),
+        "mse": num(np.mean(e ** 2), 2),
+        "rmse": num(np.sqrt(np.mean(e ** 2)), 2),
+        "mape": num(np.mean(np.abs(e[nonzero] / a[nonzero])) * 100, 2) if nonzero.any() else None,
+        "mape_excluded": int((~nonzero).sum()),
+        "mase": num(mae / scale, 3) if scale else None,
+        "mean_error": num(np.mean(e), 2),
+    }
+
+
+@app.post("/validate", dependencies=[Depends(require_api_key)])
+def validate(req: ValidateRequest):
+    y = [float(v) for v in req.values]
+    n = len(y)
+    if n < 8:
+        return {"fitted": False, "reason": "Not enough history to validate (need at least 8 periods)."}
+
+    alpha = 1 - req.confidence / 100
+
+    if req.order and req.seasonal_order:
+        order, seasonal_order = tuple(req.order), tuple(req.seasonal_order)
+        b_order = tuple(req.baseline_order) if req.baseline_order else None
+    else:
+        sarima, baseline_fit = select_models(y, req.seasonal_period)
+        if sarima is None:
+            return {"fitted": False, "reason": "No model could be fitted to this series."}
+        order, seasonal_order = sarima[0], sarima[1]
+        b_order = baseline_fit[0] if baseline_fit else None
+    if b_order is None:
+        baseline_fit = search_arima(y, order[1], 2, 2) or fit_naive(y)
+        b_order = baseline_fit[0] if baseline_fit else (0, 1, 0)
+
+    d, D, s = order[1], seasonal_order[1], seasonal_order[3]
+    s_data = s if s > 1 else req.seasonal_period
+
+    # 1. Differencing — every transformation the model applies, in order.
+    stages = [describe_stage("original", "Original series", 0, y, s_data)]
+    w, offset = np.asarray(y, dtype=float), 0
+    if D and s > 1:
+        w = w[s:] - w[:-s]
+        offset += s
+        stages.append(describe_stage("seasonal", f"Seasonal difference (lag {s})", offset, w, s_data))
+    for i in range(d):
+        w = np.diff(w)
+        offset += 1
+        stages.append(describe_stage(f"diff{i + 1}", "First difference" if i == 0 else "Second difference", offset, w, s_data))
+
+    # 2. Residual diagnostics on the full-history fit.
+    try:
+        res_full = fit_order(y, order, seasonal_order)
+    except Exception:
+        return {"fitted": False, "reason": "The selected model failed to fit the full series."}
+
+    burn = d + D * s  # the first residuals are dominated by the differencing start-up
+    resid = np.asarray(res_full.resid, dtype=float)[burn:]
+    fitted_vals = np.asarray(y, dtype=float)[burn:] - resid
+    k = order[0] + order[2] + seasonal_order[0] + seasonal_order[2]
+    max_lb = min(2 * s if s > 1 else 10, len(resid) // 2)
+    ljung_box = []
+    if max_lb > k:
+        try:
+            lb = acorr_ljungbox(resid, lags=list(range(k + 1, max_lb + 1)), model_df=k, return_df=True)
+            ljung_box = [{"lag": int(lag), "statistic": num(row["lb_stat"]), "p_value": num(row["lb_pvalue"])} for lag, row in lb.iterrows()]
+        except Exception:
+            ljung_box = []
+    jb_stat, jb_p = sps.jarque_bera(resid) if len(resid) >= 8 else (None, None)
+
+    residuals = {
+        "offset": burn,
+        "values": nums(resid, 2),
+        "fitted": nums(fitted_vals, 2),
+        "mean": num(np.mean(resid), 3),
+        "std": num(np.std(resid, ddof=1), 3),
+        "skewness": num(sps.skew(resid), 3),
+        "excess_kurtosis": num(sps.kurtosis(resid), 3),
+        "jarque_bera": {"statistic": num(jb_stat), "p_value": num(jb_p)},
+        "ljung_box": ljung_box,
+        "ljung_box_model_df": k,
+        "white_noise": bool(ljung_box[-1]["p_value"] > 0.05) if ljung_box and ljung_box[-1]["p_value"] is not None else None,
+        "correlogram": correlogram(resid, max(2 * s, 12) if s > 1 else 12),
+    }
+
+    # 3. Out-of-sample test: refit on the training window, forecast the hold-out
+    #    (same 20%-clamped-to-3..12 window as the /forecast backtest).
+    holdout = min(12, max(3, int(n * 0.2)))
+    train, actual = y[:n - holdout], y[n - holdout:]
+    test = {"available": False, "holdout": holdout, "train_size": n - holdout}
+    if len(train) >= 4:
+        try:
+            frame = fit_order(train, order, seasonal_order).get_forecast(holdout).summary_frame(alpha=alpha)
+            pred = np.maximum(frame["mean"].to_numpy(), 0)
+            lower = np.maximum(frame["mean_ci_lower"].to_numpy(), 0)
+            upper = np.maximum(frame["mean_ci_upper"].to_numpy(), pred)
+
+            try:
+                b_pred = np.maximum(fit_order(train, b_order, (0, 0, 0, 0)).get_forecast(holdout).predicted_mean, 0)
+            except Exception:
+                b_pred = None
+
+            m = s_data if s_data > 1 and len(train) > s_data else 1
+            naive = np.array([train[len(train) - m + (h % m)] for h in range(holdout)], dtype=float)
+
+            test.update({
+                "available": True,
+                "mase_period": m,
+                "points": [{
+                    "actual": num(a, 2),
+                    "predicted": num(p, 2),
+                    "lower": num(lo, 2),
+                    "upper": num(hi, 2),
+                    "error": num(a - p, 2),
+                    "pct_error": num((a - p) / a * 100, 2) if a != 0 else None,
+                    "baseline": num(b_pred[i], 2) if b_pred is not None else None,
+                    "naive": num(naive[i], 2),
+                } for i, (a, p, lo, hi) in enumerate(zip(actual, pred, lower, upper))],
+                "metrics": {
+                    "sarima": error_metrics(actual, pred, train, m),
+                    "baseline": error_metrics(actual, b_pred, train, m) if b_pred is not None else None,
+                    "naive": error_metrics(actual, naive, train, m),
+                },
+            })
+        except Exception:
+            pass
+
+    return {
+        "fitted": True,
+        "order": list(order),
+        "seasonal_order": list(seasonal_order),
+        "order_label": order_label(order, seasonal_order),
+        "baseline_order_label": order_label(b_order, (0, 0, 0, 0)),
+        "aicc": num(res_full.aicc, 2),
+        "n": n,
+        "seasonal_period": s_data,
+        "confidence": req.confidence,
+        "differencing": {"d": d, "D": D, "s": s, "stages": stages},
+        "residuals": residuals,
+        "test": test,
+    }
